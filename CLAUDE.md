@@ -146,3 +146,13 @@ the forked worker, not the gunicorn master.
   deliberately, so the scheduled run reports them.
   `test_routine_status_output_cannot_trip_the_scheduled_scan` guards this.
   Keep it in mind for any new `print` in the receiver.
+- **Health is checked over HTTP, not through logs** (`drain_health.py`). The
+  receiver's own router lines (~32/min, can't be disabled) mean the 1,500-line
+  pull sees only ~45 min of this app's logs, so `ERROR` lines alone are an
+  unreliable alarm. `GET /status` exposes last-frame-per-app, last Slack
+  ok/failure, and flush-thread liveness. `drain_health.evaluate()` is pure and
+  measures ages on the receiver's clock. Any problem → `send_drain_problem` and
+  `main.check_app` **falls through to the normal pull** for that app.
+- `_post_to_slack` / `send_error_report` / `send_drain_*` return whether Slack
+  accepted the post (True in `DRY_RUN`). The receiver relies on this to detect
+  a broken webhook, so don't revert them to returning None.

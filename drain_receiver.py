@@ -27,6 +27,7 @@ the scheduled run does surface them.
 import atexit
 import base64
 import binascii
+import json
 import re
 import secrets
 import threading
@@ -123,6 +124,36 @@ class DrainState:
         self._buffers: dict[str, _AppBuffer] = {}
         self._seen_frames: OrderedDict[str, None] = OrderedDict()
         self._flusher = None
+        # Health, read by the scheduled run via GET /status. Epoch seconds.
+        self.started_at = time.time()
+        self.last_frame_at: dict[str, float] = {}
+        self.last_slack_ok_at = None
+        self.last_slack_failure_at = None
+        self.last_slack_failure = None
+
+    def record_frame(self, app_name):
+        with self._lock:
+            self.last_frame_at[app_name] = time.time()
+
+    def _record_slack(self, delivered, failure=None):
+        with self._lock:
+            if delivered:
+                self.last_slack_ok_at = time.time()
+            else:
+                self.last_slack_failure_at = time.time()
+                self.last_slack_failure = failure
+
+    def status(self):
+        with self._lock:
+            return {
+                "started_at": self.started_at,
+                "now": time.time(),
+                "last_frame_at": dict(self.last_frame_at),
+                "last_slack_ok_at": self.last_slack_ok_at,
+                "last_slack_failure_at": self.last_slack_failure_at,
+                "last_slack_failure": self.last_slack_failure,
+                "flusher_running": self._flusher is not None and self._flusher.is_alive(),
+            }
 
     def is_duplicate_frame(self, frame_id):
         """True if this Logplex frame was already accepted (Logplex retries on failure)."""
@@ -150,16 +181,23 @@ class DrainState:
             self._buffers = {}
         for app_name, buf in pending.items():
             try:
+                delivered = True
                 if buf.errors or buf.warnings:
-                    slack_notifier.send_error_report(app_name, buf.errors, buf.warnings)
+                    delivered = slack_notifier.send_error_report(app_name, buf.errors, buf.warnings)
                 if buf.dropped:
-                    slack_notifier.send_drain_overflow(app_name, buf.dropped)
-                print(
-                    f"drain flush: app={app_name} sent={len(buf.errors)}+{len(buf.warnings)} "
-                    f"over_limit={buf.dropped}"
-                )
+                    delivered = slack_notifier.send_drain_overflow(app_name, buf.dropped) and delivered
             except Exception as exc:  # noqa: BLE001 - keep flushing other apps
+                self._record_slack(False, type(exc).__name__)
                 print(f"ERROR drain flush for {app_name} could not post to Slack: {type(exc).__name__}")
+                continue
+            self._record_slack(delivered, None if delivered else "non-2xx response")
+            if not delivered:
+                print(f"ERROR drain flush for {app_name}: Slack rejected the post")
+                continue
+            print(
+                f"drain flush: app={app_name} sent={len(buf.errors)}+{len(buf.warnings)} "
+                f"over_limit={buf.dropped}"
+            )
 
     def ensure_flusher(self):
         """Start the flush thread once, lazily, so it runs in the gunicorn worker (post-fork)."""
@@ -196,9 +234,12 @@ def is_authorized(header_value):
     return secrets.compare_digest(f"{username}:{password}".encode(), expected.encode())
 
 
-def _respond(start_response, status, body=b"", headers=None):
-    start_response(status, [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))] + (headers or []))
+def _respond(start_response, status, body=b"", headers=None, content_type="text/plain"):
+    start_response(status, [("Content-Type", content_type), ("Content-Length", str(len(body)))] + (headers or []))
     return [body]
+
+
+_UNAUTHORIZED = ("401 Unauthorized", b"", [("WWW-Authenticate", 'Basic realm="drain"')])
 
 
 def app(environ, start_response):
@@ -209,6 +250,13 @@ def app(environ, start_response):
     if method == "GET" and path in ("/", "/health"):
         return _respond(start_response, "200 OK", b"ok")
 
+    if method == "GET" and path == "/status":
+        if not is_authorized(environ.get("HTTP_AUTHORIZATION")):
+            return _respond(start_response, *_UNAUTHORIZED)
+        STATE.ensure_flusher()
+        body = json.dumps(STATE.status()).encode()
+        return _respond(start_response, "200 OK", body, content_type="application/json")
+
     if not path.startswith("/drain/"):
         return _respond(start_response, "404 Not Found")
     app_name = path[len("/drain/"):]
@@ -217,7 +265,7 @@ def app(environ, start_response):
     if method != "POST":
         return _respond(start_response, "405 Method Not Allowed", headers=[("Allow", "POST")])
     if not is_authorized(environ.get("HTTP_AUTHORIZATION")):
-        return _respond(start_response, "401 Unauthorized", headers=[("WWW-Authenticate", 'Basic realm="drain"')])
+        return _respond(start_response, *_UNAUTHORIZED)
 
     try:
         length = int(environ.get("CONTENT_LENGTH") or 0)
@@ -227,6 +275,7 @@ def app(environ, start_response):
         return _respond(start_response, "413 Payload Too Large")
 
     STATE.ensure_flusher()
+    STATE.record_frame(app_name)
     if STATE.is_duplicate_frame(environ.get("HTTP_LOGPLEX_FRAME_ID")):
         return _respond(start_response, "204 No Content")
 

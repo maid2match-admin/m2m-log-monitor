@@ -56,6 +56,8 @@ Environment variables are loaded from `.env` automatically via
 | `DRAIN_USERNAME` | no | Basic-auth username in the drain URL (default `logplex`) |
 | `DRAIN_FLUSH_SECONDS` | no | How often the receiver posts buffered lines to Slack (default `30`) |
 | `DRAIN_MAX_BUFFERED_LINES` | no | Most lines held per app between posts; the excess is summarised (default `200`) |
+| `DRAIN_RECEIVER_URL` | if `DRAIN_APPS` is set | Base URL the scheduled run uses to reach the receiver's `GET /status` |
+| `DRAIN_STALE_MINUTES` | no | Minutes an app may go without delivering a line before its drain counts as broken (default `60`) |
 
 ## Running
 
@@ -115,13 +117,22 @@ heroku config:set DRAIN_PASSWORD="$(openssl rand -hex 32)" -a m2m-log-monitor
 heroku ps:scale web=1:basic -a m2m-log-monitor
 heroku drains:add "https://logplex:<DRAIN_PASSWORD>@<m2m-log-monitor host>/drain/m2m-proxy" -a m2m-proxy
 # once lines are arriving, stop the scheduled run scanning the same logs:
-heroku config:set DRAIN_APPS=m2m-proxy -a m2m-log-monitor
+heroku config:set DRAIN_APPS=m2m-proxy DRAIN_RECEIVER_URL=https://<m2m-log-monitor host> -a m2m-log-monitor
 ```
 
 `DRAIN_APPS` gates both the receiver (unknown apps get 404) and the scheduled
 skip, so set it before attaching the drain if you want the first lines
 accepted, at the cost of a brief overlap where both report. The scheduled run
 keeps checking maintenance mode and dyno health for drain apps.
+
+**Self-check.** The receiver reports its health at `GET /status` (same Basic
+auth): when each app last delivered a line, the last Slack success and
+failure, and whether the flush thread is alive. For every drain app, the
+scheduled run reads `/status`. If the receiver is unreachable, rejects the
+credentials, has heard nothing for `DRAIN_STALE_MINUTES`, or last failed to
+post to Slack, the run posts a "log drain is unhealthy" alert and falls back
+to the 1,500-line pull for that app. A broken drain therefore means partial
+coverage plus an alert, never silence.
 
 ## Tests
 

@@ -86,6 +86,12 @@ DRAIN_PASSWORD = os.environ.get("DRAIN_PASSWORD", "")
 DRAIN_FLUSH_SECONDS = int(os.environ.get("DRAIN_FLUSH_SECONDS", "30"))
 DRAIN_MAX_BUFFERED_LINES = int(os.environ.get("DRAIN_MAX_BUFFERED_LINES", "200"))
 
+# Where the scheduled run reaches the receiver's GET /status, and how long an
+# app may go without delivering any log line before the drain is treated as
+# broken (that run then falls back to the log-session pull and alerts).
+DRAIN_RECEIVER_URL = os.environ.get("DRAIN_RECEIVER_URL", "")
+DRAIN_STALE_MINUTES = int(os.environ.get("DRAIN_STALE_MINUTES", "60"))
+
 # Logplex batches are small (a few hundred lines); anything far larger is not
 # a real drain delivery.
 DRAIN_MAX_BODY_BYTES = 2 * 1024 * 1024

@@ -14,6 +14,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import config
+import drain_health
 import heroku_client
 import log_parser
 import slack_notifier
@@ -33,8 +34,12 @@ def check_app(app_name):
 
     if app_name in config.DRAIN_APPS:
         # Logs stream to drain_receiver.py; scanning them here too would
-        # report the same lines twice.
-        return "ok (logs via drain, dynos_down=%d)" % len(down_dynos)
+        # report the same lines twice — unless the drain is broken, in which
+        # case alert and fall through to the pull so coverage isn't zero.
+        drain_problems = drain_health.check(app_name)
+        if not drain_problems:
+            return "ok (logs via drain, dynos_down=%d)" % len(down_dynos)
+        slack_notifier.send_drain_problem(app_name, drain_problems)
 
     has_state_store = bool(config.DATABASE_URL)
     last_ts, last_hash, had_errors_before = (

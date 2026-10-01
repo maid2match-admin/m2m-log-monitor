@@ -4,6 +4,7 @@ import io
 import pytest
 
 import config
+import drain_health
 import drain_receiver
 import main
 import slack_notifier
@@ -43,12 +44,32 @@ def drain_config(monkeypatch):
 @pytest.fixture
 def slack(monkeypatch):
     sent = []
-    monkeypatch.setattr(slack_notifier, "_post_to_slack", sent.append)
+
+    def fake_post(text):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(slack_notifier, "_post_to_slack", fake_post)
     return sent
 
 
 def basic(user="logplex", password="s3cret"):
     return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+def get_status(auth=None):
+    import json
+
+    environ = {"REQUEST_METHOD": "GET", "PATH_INFO": "/status", "wsgi.input": io.BytesIO(b"")}
+    if auth is not None:
+        environ["HTTP_AUTHORIZATION"] = auth
+    captured = {}
+
+    def start_response(status, headers):
+        captured["status"] = status
+
+    body = b"".join(drain_receiver.app(environ, start_response))
+    return captured["status"], (json.loads(body) if body else None)
 
 
 def post(body, path="/drain/m2m-proxy", auth=None, frame_id=None, method="POST"):
@@ -219,9 +240,114 @@ def test_routine_status_output_cannot_trip_the_scheduled_scan(drain_config, slac
 def test_scheduled_run_skips_log_scan_for_drain_apps(monkeypatch):
     monkeypatch.setattr(main.heroku_client, "get_maintenance_mode", lambda app: False)
     monkeypatch.setattr(main.heroku_client, "get_dynos", lambda app: [])
+    monkeypatch.setattr(main.drain_health, "check", lambda app: [])
 
     def no_log_session(app):
         raise AssertionError("log session must not be opened for a drain app")
 
     monkeypatch.setattr(main.heroku_client, "create_log_session", no_log_session)
     assert main.check_app("m2m-proxy") == "ok (logs via drain, dynos_down=0)"
+
+
+def test_unhealthy_drain_alerts_and_falls_back_to_log_pull(monkeypatch, slack):
+    monkeypatch.setattr(config, "DATABASE_URL", "")
+    monkeypatch.setattr(main.heroku_client, "get_maintenance_mode", lambda app: False)
+    monkeypatch.setattr(main.heroku_client, "get_dynos", lambda app: [])
+    monkeypatch.setattr(main.drain_health, "check", lambda app: ["receiver unreachable (ConnectionError)"])
+    monkeypatch.setattr(main.heroku_client, "create_log_session", lambda app: "https://logplex.example/session")
+    monkeypatch.setattr(
+        main.heroku_client,
+        "fetch_log_text",
+        lambda url: "2099-01-01T00:00:00+00:00 app[web.1]: " + JSON_ERROR + "\n",
+    )
+    result = main.check_app("m2m-proxy")
+    assert result.startswith("ok (errors=1")
+    assert "log drain is unhealthy" in slack[0]
+    assert "receiver unreachable" in slack[0]
+    assert "1 error line(s)" in slack[1]
+
+
+# --- receiver health (/status) and its evaluation ------------------------------
+
+def test_status_requires_auth():
+    status, _ = get_status()
+    assert status.startswith("401")
+
+
+def test_status_reports_frames_and_slack_outcome(drain_config, slack):
+    post(frame(syslog("app", "web.1", JSON_ERROR)), auth=basic())
+    drain_config.flush()
+    status, body = get_status(auth=basic())
+    assert status == "200 OK"
+    assert "m2m-proxy" in body["last_frame_at"]
+    assert body["last_slack_ok_at"] is not None
+    assert body["last_slack_failure_at"] is None
+
+
+def test_slack_non_2xx_is_recorded_as_failure(monkeypatch, drain_config, capsys):
+    monkeypatch.setattr(slack_notifier, "_post_to_slack", lambda text: False)
+    post(frame(syslog("app", "web.1", JSON_ERROR)), auth=basic())
+    drain_config.flush()
+    assert drain_config.status()["last_slack_failure"] == "non-2xx response"
+    assert "Slack rejected the post" in capsys.readouterr().out
+
+
+def _status(**overrides):
+    base = {
+        "started_at": 1000.0,
+        "now": 1000.0 + 30 * 60,
+        "last_frame_at": {"m2m-proxy": 1000.0 + 29 * 60},
+        "last_slack_ok_at": None,
+        "last_slack_failure_at": None,
+        "last_slack_failure": None,
+        "flusher_running": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_evaluate_healthy():
+    assert drain_health.evaluate(_status(), "m2m-proxy", stale_minutes=60) == []
+
+
+def test_evaluate_flags_stale_drain():
+    problems = drain_health.evaluate(
+        _status(now=1000.0 + 200 * 60, last_frame_at={"m2m-proxy": 1000.0}), "m2m-proxy", 60
+    )
+    assert problems == [problems[0]] and "no log lines received for 200 min" in problems[0]
+
+
+def test_evaluate_flags_never_received_after_grace_period():
+    problems = drain_health.evaluate(_status(now=1000.0 + 90 * 60, last_frame_at={}), "m2m-proxy", 60)
+    assert "since the receiver started 90 min ago" in problems[0]
+
+
+def test_evaluate_gives_a_fresh_receiver_grace_period():
+    assert drain_health.evaluate(_status(last_frame_at={}), "m2m-proxy", 60) == []
+
+
+def test_evaluate_flags_slack_failure_only_until_a_later_success():
+    failing = _status(last_slack_ok_at=1100.0, last_slack_failure_at=1200.0, last_slack_failure="ConnectionError")
+    assert "most recent Slack post failed" in drain_health.evaluate(failing, "m2m-proxy", 60)[0]
+    recovered = _status(last_slack_ok_at=1300.0, last_slack_failure_at=1200.0)
+    assert drain_health.evaluate(recovered, "m2m-proxy", 60) == []
+
+
+def test_evaluate_flags_dead_flush_thread():
+    assert "flush thread is not running" in drain_health.evaluate(_status(flusher_running=False), "m2m-proxy", 60)[0]
+
+
+def test_fetch_status_maps_bad_credentials(monkeypatch):
+    class Resp:
+        status_code = 401
+        ok = False
+
+    monkeypatch.setattr(config, "DRAIN_RECEIVER_URL", "https://receiver.example")
+    monkeypatch.setattr(drain_health.requests, "get", lambda *a, **k: Resp())
+    status, problem = drain_health.fetch_status()
+    assert status is None and "credentials" in problem
+
+
+def test_fetch_status_without_url_is_a_problem(monkeypatch):
+    monkeypatch.setattr(config, "DRAIN_RECEIVER_URL", "")
+    assert drain_health.check("m2m-proxy") == ["DRAIN_RECEIVER_URL is not set, so the receiver can't be checked"]

@@ -9,9 +9,14 @@ _MAX_CHUNK_CHARS = 3500
 
 
 def _post_to_slack(text):
+    """Send one message; return True if Slack accepted it (always True in DRY_RUN).
+
+    A non-2xx response is printed and reported as False rather than raised, so
+    one bad post never aborts a run. Network failures still raise.
+    """
     if config.DRY_RUN:
         print("[DRY_RUN] Would send to Slack:\n" + text)
-        return
+        return True
     response = requests.post(
         config.SLACK_WEBHOOK_URL,
         json={
@@ -26,6 +31,7 @@ def _post_to_slack(text):
             f"Failed to post to Slack ({response.status_code}): "
             f"{response.text[:500]}"
         )
+    return response.ok
 
 
 def _chunk_lines(raw_lines, max_chars=_MAX_CHUNK_CHARS):
@@ -59,11 +65,13 @@ def send_error_report(app_name, errors, warnings):
     chunks = _chunk_lines(raw_lines)
 
     total_parts = len(chunks)
+    delivered = True
     for index, chunk in enumerate(chunks, start=1):
         part_suffix = f" (part {index}/{total_parts})" if total_parts > 1 else ""
         body = "\n".join(chunk)
         text = f"{header}{part_suffix}\n```\n{body}\n```"
-        _post_to_slack(text)
+        delivered = _post_to_slack(text) and delivered
+    return delivered
 
 
 def send_dyno_down(app_name, down_dynos):
@@ -86,7 +94,17 @@ def send_drain_overflow(app_name, dropped):
         "drain in this interval but were not sent (buffer limit). Check "
         f"`heroku logs -a {app_name}` for the full picture."
     )
-    _post_to_slack(text)
+    return _post_to_slack(text)
+
+
+def send_drain_problem(app_name, problems):
+    """Alert that the log drain for an app is unhealthy (scheduled run fell back to polling)."""
+    lines = "\n".join(f"- {problem}" for problem in problems)
+    text = (
+        f"*{app_name}*: log drain is unhealthy, so this run fell back to the "
+        f"1500-line log pull (partial coverage):\n{lines}"
+    )
+    return _post_to_slack(text)
 
 
 def send_check_failure(app_name, error):
