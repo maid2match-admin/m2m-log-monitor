@@ -1,6 +1,6 @@
 """Heroku HTTPS log drain receiver.
 
-The scheduled run (main.py) pulls at most 1500 log lines per app every 6 hours,
+The scheduled run (main.py) pulls at most 1500 log lines per app each hour,
 which is only ~30 minutes of m2m-proxy's output. Apps listed in DRAIN_APPS
 instead stream every log line here as Logplex POSTs it, so nothing is missed:
 

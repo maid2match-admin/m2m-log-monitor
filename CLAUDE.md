@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A standalone Python script (not a long-running server) that Heroku Scheduler
-invokes every 6 hours. Each run walks the fleet of apps in
+invokes every hour, at 10 minutes past (every 6 hours until 2026-10-01). Each run walks the fleet of apps in
 `config.MONITORED_APPS`, checks each one's maintenance mode / dyno health /
 recent logs, and posts findings to Slack. There is no web framework, queue,
 or persistent process — `main.py` runs to completion and exits. The one
@@ -118,7 +118,7 @@ does not stop the run for remaining apps.
 
 **Known limitation:** Heroku's log-session API returns a rolling buffer, not
 a true time-range query. A very high-volume dyno can produce enough output
-to roll past 6 hours between runs, and those lines are silently missed —
+to roll past the hour between runs, and those lines are silently missed —
 accepted tradeoff for most apps. When an app outgrows it (`m2m-proxy`:
 1,500 lines ≈ 30 min), move that app to the drain receiver instead of
 changing the scheduled run.

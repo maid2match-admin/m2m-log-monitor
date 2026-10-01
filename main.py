@@ -1,6 +1,6 @@
 """Heroku multi-app log monitor.
 
-Run every 6 hours by Heroku Scheduler. For each monitored app:
+Run hourly (at :10) by Heroku Scheduler. For each monitored app:
   1. Skip entirely if the app is in maintenance mode.
   2. Alert if any dyno is crashed/down.
   3. Fetch recent logs, report new error lines (and warning lines if

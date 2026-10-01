@@ -1,6 +1,6 @@
 # m2m-log-monitor
 
-A scheduled health check for a fleet of Heroku apps. Every 6 hours it checks
+A scheduled health check for a fleet of Heroku apps. Every hour it checks
 each app for maintenance mode, crashed/down dynos, and new error/warning
 lines in the logs, then posts a summary to Slack.
 
@@ -89,13 +89,13 @@ heroku addons:open scheduler
 ```
 
 - Command: `python main.py`
-- Frequency: every 6 hours
+- Frequency: every hour, at :10
 
 ## Log drain receiver
 
 The scheduled run fetches at most 1,500 lines per app, the most Heroku's log-session
-API returns. For a busy app that is a small slice of 6 hours: on `m2m-proxy` it
-was about 30 minutes (~8%) when measured on 2026-10-01. For such apps,
+API returns. For a busy app that is a small slice of the interval: on `m2m-proxy` it
+was about 30 minutes, ~8% of the then 6-hour interval and still only ~50% of an hour (measured 2026-10-01). For such apps,
 `drain_receiver.py` takes a Heroku HTTPS log drain instead, so every line is
 classified the moment it is written.
 

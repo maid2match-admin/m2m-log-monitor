@@ -1,6 +1,6 @@
 {
   "name": "m2m-log-monitor",
-  "description": "Monitors error/warning logs, dyno health, and maintenance mode across the m2m/lca/mlc Heroku fleet, alerting to Slack. Run on a 6-hour Heroku Scheduler job.",
+  "description": "Monitors error/warning logs, dyno health, and maintenance mode across the m2m/lca/mlc Heroku fleet, alerting to Slack. Run on an hourly Heroku Scheduler job.",
   "keywords": ["python", "heroku", "logs", "monitoring", "slack"],
   "addons": [
     "heroku-postgresql:mini",

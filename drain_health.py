@@ -1,7 +1,7 @@
 """Scheduled-run check that the log drain receiver is actually working.
 
 The receiver's own log lines are a poor alarm: this app is busy enough that
-the scheduled run's 1500-line pull only covers part of the 6-hour window. So
+the scheduled run's 1500-line pull only covers part of each hour. So
 the receiver reports its health at GET /status, and main.check_app() asks it
 directly for every app in DRAIN_APPS. Any problem means the drain can't be
 trusted for this run: main alerts and falls back to the log-session pull, so a
