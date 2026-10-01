@@ -8,7 +8,9 @@ A standalone Python script (not a long-running server) that Heroku Scheduler
 invokes every 6 hours. Each run walks the fleet of apps in
 `config.MONITORED_APPS`, checks each one's maintenance mode / dyno health /
 recent logs, and posts findings to Slack. There is no web framework, queue,
-or persistent process — `main.py` runs to completion and exits.
+or persistent process — `main.py` runs to completion and exits. The one
+exception is the optional `web` process, `drain_receiver.py` (see "Log drain
+receiver" below).
 
 ## Commands
 
@@ -117,4 +119,30 @@ does not stop the run for remaining apps.
 **Known limitation:** Heroku's log-session API returns a rolling buffer, not
 a true time-range query. A very high-volume dyno can produce enough output
 to roll past 6 hours between runs, and those lines are silently missed —
-accepted tradeoff, not a bug to "fix" by re-architecting around it.
+accepted tradeoff for most apps. When an app outgrows it (`m2m-proxy`:
+1,500 lines ≈ 30 min), move that app to the drain receiver instead of
+changing the scheduled run.
+
+### Log drain receiver (`drain_receiver.py`)
+
+A WSGI app that gunicorn serves as the `web` process, with **one worker**: the
+per-app buffers, frame-ID de-duplication and flush thread are all
+in-process, so more workers would split buffers and double-count retried
+frames. The flush thread starts lazily on the first request so it runs in
+the forked worker, not the gunicorn master.
+
+- Logplex POSTs octet-counted RFC 5424 frames (`parse_frames`).
+  `to_log_line` rewrites each one into the exact `<ts> source[dyno]: msg`
+  shape `heroku logs` prints, so `log_parser` is reused unchanged and Slack
+  reports look the same as scheduled ones.
+- `classify_lines` = `log_parser.classify()` plus `heroku[...]` crash state
+  changes. The scheduled run catches crashes via the dyno API instead.
+- `config.DRAIN_APPS` is both the receiver's allowlist (404 otherwise) and
+  the set the scheduled run skips the log scan for (`main.check_app`).
+- **This app is itself in `MONITORED_APPS`**, and the scheduled run
+  keyword-matches its logs. So the receiver never prints drained content,
+  and its routine status line (`drain flush: ...`) avoids the words
+  error/warning. Real failures are printed with an `ERROR` prefix
+  deliberately, so the scheduled run reports them.
+  `test_routine_status_output_cannot_trip_the_scheduled_scan` guards this.
+  Keep it in mind for any new `print` in the receiver.

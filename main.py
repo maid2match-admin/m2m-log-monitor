@@ -31,6 +31,11 @@ def check_app(app_name):
     if down_dynos:
         slack_notifier.send_dyno_down(app_name, down_dynos)
 
+    if app_name in config.DRAIN_APPS:
+        # Logs stream to drain_receiver.py; scanning them here too would
+        # report the same lines twice.
+        return "ok (logs via drain, dynos_down=%d)" % len(down_dynos)
+
     has_state_store = bool(config.DATABASE_URL)
     last_ts, last_hash, had_errors_before = (
         state_store.get_last_state(app_name)

@@ -79,6 +79,16 @@ def send_resolved(app_name):
     _post_to_slack(text)
 
 
+def send_drain_overflow(app_name, dropped):
+    """Note that the drain buffer filled and further lines were not sent."""
+    text = (
+        f"*{app_name}*: {dropped} more error/warning line(s) arrived via the log "
+        "drain in this interval but were not sent (buffer limit). Check "
+        f"`heroku logs -a {app_name}` for the full picture."
+    )
+    _post_to_slack(text)
+
+
 def send_check_failure(app_name, error):
     """Alert that the monitor itself failed to check an app."""
     text = f"*{app_name}*: log monitor could not check this app: {error}"

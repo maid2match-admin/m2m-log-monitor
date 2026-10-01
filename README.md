@@ -51,6 +51,11 @@ Environment variables are loaded from `.env` automatically via
 | `LOG_SESSION_LINES` | no | Log lines fetched per app per run (default `1500`) |
 | `LOG_LOOKBACK_HOURS` | no | Only report lines from within this many hours of now (default `6`) |
 | `DRY_RUN` | no | `true` to print Slack messages instead of sending, and skip the database (default `false`) |
+| `DRAIN_APPS` | no | Comma-separated apps whose logs arrive via the drain receiver; the scheduled run skips their log scan (default empty) |
+| `DRAIN_PASSWORD` | for the receiver | Basic-auth password in the drain URL; empty rejects every POST |
+| `DRAIN_USERNAME` | no | Basic-auth username in the drain URL (default `logplex`) |
+| `DRAIN_FLUSH_SECONDS` | no | How often the receiver posts buffered lines to Slack (default `30`) |
+| `DRAIN_MAX_BUFFERED_LINES` | no | Most lines held per app between posts; the excess is summarised (default `200`) |
 
 ## Running
 
@@ -83,6 +88,40 @@ heroku addons:open scheduler
 
 - Command: `python main.py`
 - Frequency: every 6 hours
+
+## Log drain receiver
+
+The scheduled run fetches at most 1,500 lines per app, the most Heroku's log-session
+API returns. For a busy app that is a small slice of 6 hours: on `m2m-proxy` it
+was about 30 minutes (~8%) when measured on 2026-10-01. For such apps,
+`drain_receiver.py` takes a Heroku HTTPS log drain instead, so every line is
+classified the moment it is written.
+
+- Runs as the `web` process (`gunicorn`, one worker; see `Procfile`). Use a
+  Basic dyno or larger: an Eco dyno sleeps, and Logplex drops lines it can't
+  deliver.
+- Classifies with the same `log_parser.classify()` as the scheduled run, and
+  also flags `State changed from ... to crashed`.
+- Buffers lines and posts one Slack message per app every
+  `DRAIN_FLUSH_SECONDS`, so a burst of errors becomes one message.
+- Checks Basic auth from the drain URL in constant time, ignores retried
+  `Logplex-Frame-Id`s, and returns 404 for any app not in `DRAIN_APPS`.
+- `GET /` is an unauthenticated health check.
+
+Rollout for an app (`m2m-proxy` shown):
+
+```bash
+heroku config:set DRAIN_PASSWORD="$(openssl rand -hex 32)" -a m2m-log-monitor
+heroku ps:scale web=1:basic -a m2m-log-monitor
+heroku drains:add "https://logplex:<DRAIN_PASSWORD>@<m2m-log-monitor host>/drain/m2m-proxy" -a m2m-proxy
+# once lines are arriving, stop the scheduled run scanning the same logs:
+heroku config:set DRAIN_APPS=m2m-proxy -a m2m-log-monitor
+```
+
+`DRAIN_APPS` gates both the receiver (unknown apps get 404) and the scheduled
+skip, so set it before attaching the drain if you want the first lines
+accepted, at the cost of a brief overlap where both report. The scheduled run
+keeps checking maintenance mode and dyno health for drain apps.
 
 ## Tests
 

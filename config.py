@@ -63,3 +63,29 @@ HEROKU_API_BASE = "https://api.heroku.com"
 HEROKU_ACCEPT_HEADER = "application/vnd.heroku+json; version=3"
 
 HTTP_TIMEOUT_SECONDS = 30
+
+# --- Log drain receiver (drain_receiver.py) ---------------------------------
+# Apps whose logs arrive via a Heroku HTTPS log drain instead of the 1500-line
+# log-session pull. The scheduled run still checks these apps' maintenance mode
+# and dyno health, but skips their log scan so lines aren't reported twice.
+# Only list an app here once its drain is attached and delivering.
+DRAIN_APPS = frozenset(
+    name.strip()
+    for name in os.environ.get("DRAIN_APPS", "").split(",")
+    if name.strip()
+)
+
+# Basic-auth credentials embedded in the drain URL
+# (https://DRAIN_USERNAME:DRAIN_PASSWORD@<host>/drain/<app>). An empty password
+# makes the receiver reject every POST (fail closed).
+DRAIN_USERNAME = os.environ.get("DRAIN_USERNAME", "logplex")
+DRAIN_PASSWORD = os.environ.get("DRAIN_PASSWORD", "")
+
+# How often buffered lines are posted to Slack, and the most lines held per app
+# between posts (the excess is counted and summarised, not sent).
+DRAIN_FLUSH_SECONDS = int(os.environ.get("DRAIN_FLUSH_SECONDS", "30"))
+DRAIN_MAX_BUFFERED_LINES = int(os.environ.get("DRAIN_MAX_BUFFERED_LINES", "200"))
+
+# Logplex batches are small (a few hundred lines); anything far larger is not
+# a real drain delivery.
+DRAIN_MAX_BODY_BYTES = 2 * 1024 * 1024
