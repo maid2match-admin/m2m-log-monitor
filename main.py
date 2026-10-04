@@ -17,6 +17,7 @@ import config
 import drain_health
 import heroku_client
 import log_parser
+import reported_lines
 import slack_notifier
 import state_store
 from heroku_client import HerokuApiError
@@ -61,6 +62,11 @@ def check_app(app_name):
     errors, warnings = log_parser.classify(new_lines, config.REPORT_WARNINGS)
 
     if errors or warnings:
+        if has_state_store:
+            try:
+                reported_lines.store(app_name, errors, warnings)
+            except Exception as exc:  # noqa: BLE001 - still report and advance the watermark
+                print(f"{app_name}: ERROR could not store reported lines - {type(exc).__name__}")
         slack_notifier.send_error_report(app_name, errors, warnings)
     elif has_state_store and had_errors_before:
         slack_notifier.send_resolved(app_name)

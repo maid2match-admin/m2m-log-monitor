@@ -7,6 +7,7 @@ import config
 import drain_health
 import drain_receiver
 import main
+import reported_lines
 import slack_notifier
 
 
@@ -233,6 +234,94 @@ def test_routine_status_output_cannot_trip_the_scheduled_scan(drain_config, slac
     assert printed.startswith("drain flush:")
     line = log_parser.parse_log_text(f"2026-10-01T05:06:49+00:00 app[web.1]: {printed}")
     assert log_parser.classify(line, include_warnings=True) == ([], [])
+
+
+# --- archiving reported lines ------------------------------------------------
+
+@pytest.fixture
+def archive(monkeypatch):
+    stored = []
+    monkeypatch.setattr(config, "DATABASE_URL", "postgres://fake")
+    monkeypatch.setattr(
+        reported_lines, "store",
+        lambda app, errors, warnings: stored.append((app, [l.message for l in errors], [l.message for l in warnings])),
+    )
+    return stored
+
+
+def test_flush_archives_exactly_the_reported_lines(drain_config, slack, archive):
+    body = b"".join(
+        frame(syslog(src, dyno, msg))
+        for src, dyno, msg in [("app", "web.1", JSON_ERROR), ("heroku", "router", ROUTER_OK), ("heroku", "web.1", CRASH)]
+    )
+    post(body, auth=basic())
+    drain_config.flush()
+    assert archive == [("m2m-proxy", [JSON_ERROR, CRASH], [])]
+    assert len(slack) == 1
+
+
+def test_quiet_interval_archives_nothing(drain_config, slack, archive):
+    post(frame(syslog("heroku", "router", ROUTER_OK)), auth=basic())
+    drain_config.flush()
+    assert archive == []
+
+
+def test_archive_failure_still_posts_to_slack_and_is_reported(monkeypatch, drain_config, slack, capsys):
+    monkeypatch.setattr(config, "DATABASE_URL", "postgres://fake")
+
+    def broken_store(*_args):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(reported_lines, "store", broken_store)
+    post(frame(syslog("app", "web.1", JSON_ERROR)), auth=basic())
+    drain_config.flush()
+    assert len(slack) == 1
+    assert "ERROR drain flush for m2m-proxy could not store reported lines" in capsys.readouterr().out
+
+
+def test_archives_even_when_slack_is_down(monkeypatch, drain_config, archive):
+    monkeypatch.setattr(slack_notifier, "_post_to_slack", lambda text: False)
+    post(frame(syslog("app", "web.1", JSON_ERROR)), auth=basic())
+    drain_config.flush()
+    assert len(archive) == 1
+
+
+def test_no_database_url_skips_archiving(monkeypatch, drain_config, slack):
+    def must_not_store(*_args):
+        raise AssertionError("must not store without DATABASE_URL")
+
+    monkeypatch.setattr(reported_lines, "store", must_not_store)
+    post(frame(syslog("app", "web.1", JSON_ERROR)), auth=basic())
+    drain_config.flush()
+    assert len(slack) == 1
+
+
+def _pulled_app(monkeypatch, log_text):
+    monkeypatch.setattr(main.heroku_client, "get_maintenance_mode", lambda app: False)
+    monkeypatch.setattr(main.heroku_client, "get_dynos", lambda app: [])
+    monkeypatch.setattr(main.heroku_client, "create_log_session", lambda app: "https://logplex.example/session")
+    monkeypatch.setattr(main.heroku_client, "fetch_log_text", lambda url: log_text)
+    monkeypatch.setattr(main.state_store, "get_last_state", lambda app: (None, None, False))
+    monkeypatch.setattr(main.state_store, "set_last_state", lambda *args: None)
+
+
+def test_scheduled_run_archives_reported_lines(monkeypatch, slack, archive):
+    _pulled_app(monkeypatch, "2099-01-01T00:00:00+00:00 app[web.1]: " + JSON_ERROR + "\n")
+    assert main.check_app("m2m-sandbox-proxy").startswith("ok (errors=1")
+    assert archive == [("m2m-sandbox-proxy", [JSON_ERROR], [])]
+
+
+def test_scheduled_run_archive_failure_still_reports(monkeypatch, slack, capsys):
+    monkeypatch.setattr(config, "DATABASE_URL", "postgres://fake")
+
+    def broken_store(*_args):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(reported_lines, "store", broken_store)
+    _pulled_app(monkeypatch, "2099-01-01T00:00:00+00:00 app[web.1]: " + JSON_ERROR + "\n")
+    assert main.check_app("m2m-sandbox-proxy").startswith("ok (errors=1")
+    assert "1 error line(s)" in slack[0]
+    assert "ERROR could not store reported lines" in capsys.readouterr().out
 
 
 # --- scheduled run hand-off ---------------------------------------------------

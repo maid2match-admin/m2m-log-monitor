@@ -64,6 +64,10 @@ HEROKU_ACCEPT_HEADER = "application/vnd.heroku+json; version=3"
 
 HTTP_TIMEOUT_SECONDS = 30
 
+# How long reported error/warning lines are kept in the reported_lines table
+# (reported_lines.py). Pruned on every write.
+REPORTED_LINES_RETENTION_DAYS = int(os.environ.get("REPORTED_LINES_RETENTION_DAYS", "30"))
+
 # --- Log drain receiver (drain_receiver.py) ---------------------------------
 # Apps whose logs arrive via a Heroku HTTPS log drain instead of the 1500-line
 # log-session pull. The scheduled run still checks these apps' maintenance mode

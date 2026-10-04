@@ -13,6 +13,8 @@ lines in the logs, then posts a summary to Slack.
   actionable
 - Sends a "resolved" message when a previously-erroring app comes back clean
 - Posts findings to a Slack channel via an Incoming Webhook
+- Keeps every reported line in Postgres for 30 days, so an incident can be
+  looked up after Heroku's short log buffer has rotated (see "Reported lines archive")
 
 The list of monitored apps lives in `config.py` (`MONITORED_APPS`).
 
@@ -50,7 +52,8 @@ Environment variables are loaded from `.env` automatically via
 | `REPORT_WARNINGS` | no | `true` to also report warning lines (default `false`) |
 | `LOG_SESSION_LINES` | no | Log lines fetched per app per run (default `1500`) |
 | `LOG_LOOKBACK_HOURS` | no | Only report lines from within this many hours of now (default `6`) |
-| `DRY_RUN` | no | `true` to print Slack messages instead of sending, and skip the database (default `false`) |
+| `REPORTED_LINES_RETENTION_DAYS` | no | Days reported lines are kept in the `reported_lines` table (default `30`) |
+| `DRY_RUN` | no | `true` to print Slack messages instead of sending, and skip `reported_lines` archiving (default `false`). The `seen_state` watermark is still written when `DATABASE_URL` is set, so unset it for a side-effect-free run |
 | `DRAIN_APPS` | no | Comma-separated apps whose logs arrive via the drain receiver; the scheduled run skips their log scan (default empty) |
 | `DRAIN_PASSWORD` | for the receiver | Basic-auth password in the drain URL; empty rejects every POST |
 | `DRAIN_USERNAME` | no | Basic-auth username in the drain URL (default `logplex`) |
@@ -133,6 +136,30 @@ credentials, has heard nothing for `DRAIN_STALE_MINUTES`, or last failed to
 post to Slack, the run posts a "log drain is unhealthy" alert and falls back
 to the 1,500-line pull for that app. A broken drain therefore means partial
 coverage plus an alert, never silence.
+
+## Reported lines archive
+
+Every error/warning line sent to Slack is also written to the `reported_lines`
+table (`reported_lines.py`) by both the scheduled run and the drain receiver. Each row
+holds the app, severity, the line's own timestamp and the raw line. Rows older than
+`REPORTED_LINES_RETENTION_DAYS` are pruned on each write. The table is created on
+first use, and nothing is stored when `DATABASE_URL` is unset.
+
+Only reported lines are kept. INFO lines aren't, and neither are the over-limit lines a
+drain flush summarises as "N more". Storage failures never block the Slack post: they
+are printed with an `ERROR` prefix, so the next scheduled run reports them.
+
+Query it **locally** with `heroku pg:psql`, not `heroku run`. A one-off dyno's
+output lands in this app's own logs, and the scheduled run would report the
+lines a second time:
+
+```bash
+heroku pg:psql -a m2m-log-monitor -c "
+  SELECT logged_at, severity, line FROM reported_lines
+  WHERE app_name = 'm2m-proxy'
+    AND logged_at BETWEEN '2026-10-04 06:20Z' AND '2026-10-04 06:40Z'
+  ORDER BY logged_at"
+```
 
 ## Tests
 

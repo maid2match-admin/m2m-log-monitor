@@ -36,6 +36,7 @@ from collections import OrderedDict
 
 import config
 import log_parser
+import reported_lines
 import slack_notifier
 
 # RFC 5424 header as Heroku sends it: <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME
@@ -180,6 +181,8 @@ class DrainState:
             pending = {name: buf for name, buf in self._buffers.items() if not buf.is_empty()}
             self._buffers = {}
         for app_name, buf in pending.items():
+            # Archive before posting, so the lines are kept even if Slack is down.
+            self._archive(app_name, buf)
             try:
                 delivered = True
                 if buf.errors or buf.warnings:
@@ -198,6 +201,15 @@ class DrainState:
                 f"drain flush: app={app_name} sent={len(buf.errors)}+{len(buf.warnings)} "
                 f"over_limit={buf.dropped}"
             )
+
+    @staticmethod
+    def _archive(app_name, buf):
+        if not config.DATABASE_URL or not (buf.errors or buf.warnings):
+            return
+        try:
+            reported_lines.store(app_name, buf.errors, buf.warnings)
+        except Exception as exc:  # noqa: BLE001 - storage must never block the Slack post
+            print(f"ERROR drain flush for {app_name} could not store reported lines: {type(exc).__name__}")
 
     def ensure_flusher(self):
         """Start the flush thread once, lazily, so it runs in the gunicorn worker (post-fork)."""

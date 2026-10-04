@@ -33,11 +33,15 @@ Config is read from environment variables, loaded from a local `.env` via
 `python-dotenv` if present (see `.env.example`). `DATABASE_URL` unset skips
 the Postgres watermark store entirely — useful for a dry run that shouldn't
 mutate the production `seen_state` table (the same table the real Scheduler
-job writes to).
+job writes to). Note `DRY_RUN` itself does **not** skip `seen_state`, only
+Slack sends and `reported_lines` archiving. `tests/conftest.py` blanks
+`config.DATABASE_URL` for every test because `.env` points at production; tests
+that exercise storage set their own value and fake the connection. Don't remove
+that fixture.
 
 ## Architecture
 
-Five modules, each a thin, independently-testable layer; `main.py` wires
+Six modules, each a thin, independently-testable layer; `main.py` wires
 them together with no business logic of its own beyond the per-app loop:
 
 - **`config.py`** — all environment/env-derived values (`MONITORED_APPS`,
@@ -87,6 +91,13 @@ them together with no business logic of its own beyond the per-app loop:
   detect "back to clean" for the resolved-notification). `psycopg.connect`
   is the only thing tests mock (see `tests/test_state_store.py`'s
   `FakeConnection`/`FakeCursor`) — there's no ORM.
+- **`reported_lines.py`** — Postgres archive of every line sent to Slack
+  (`reported_lines` table, pruned past `REPORTED_LINES_RETENTION_DAYS` on each
+  write, schema created lazily on first write per process). Written by both
+  `main.check_app` and the drain flush, **before** the Slack post, and a storage
+  failure never blocks the post. Read it with local `heroku pg:psql`, never
+  `heroku run`: one-off dyno output feeds this app's own logs, so the scheduled
+  run would report it again.
 - **`slack_notifier.py`** — all outbound Slack messages go through
   `_post_to_slack`, which is the single `DRY_RUN` gate (prints instead of
   POSTing) and sets an explicit `username`/`icon_emoji` on every payload so
