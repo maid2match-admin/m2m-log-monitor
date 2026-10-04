@@ -142,6 +142,11 @@ in-process, so more workers would split buffers and double-count retried
 frames. The flush thread starts lazily on the first request so it runs in
 the forked worker, not the gunicorn master.
 
+`--keep-alive 100` in the Procfile must stay above the Heroku router's 90s
+idle timeout for dyno connections. With gunicorn's 2s default, Logplex POSTs
+arriving ~2s apart raced gunicorn closing the idle connection, and the router
+logged sporadic `H13 Connection closed without response` (service=0ms).
+
 - Logplex POSTs octet-counted RFC 5424 frames (`parse_frames`).
   `to_log_line` rewrites each one into the exact `<ts> source[dyno]: msg`
   shape `heroku logs` prints, so `log_parser` is reused unchanged and Slack
