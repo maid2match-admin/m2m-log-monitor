@@ -75,3 +75,29 @@ def store(app_name, errors, warnings):
         conn.commit()
     _schema_ready = True
     return len(rows)
+
+
+def store_call_audit(app_name, lines):
+    """Persist audit warnings before drain ACK; at-least-once on uncertain commits.
+
+    This reuses the existing private archive and retention, with bounded DB
+    I/O. Unlike alert archiving, a failure must reach the caller for retry.
+    """
+    if config.DRY_RUN:
+        return len(lines)
+    if not config.DATABASE_URL:
+        raise RuntimeError("call audit requires database configuration")
+    rows = [(app_name, "warning", line.timestamp, line.raw) for line in lines]
+    if not rows:
+        return 0
+    with psycopg.connect(config.DATABASE_URL, connect_timeout=5,
+                         options="-c statement_timeout=3000 -c lock_timeout=2000") as conn:
+        with conn.cursor() as cur:
+            # Existing table/schema is a deployment prerequisite. Do not do
+            # DDL on Logplex's delivery path.
+            cur.executemany(_INSERT_SQL, rows)
+            if cur.rowcount != len(rows):
+                raise RuntimeError("incomplete call audit insert")
+            cur.execute(_PRUNE_SQL, (config.REPORTED_LINES_RETENTION_DAYS,))
+        conn.commit()
+    return len(rows)

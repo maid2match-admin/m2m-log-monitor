@@ -203,6 +203,22 @@ def classify(lines, include_warnings):
     return errors, warnings
 
 
+def unpaginated_call_warnings(lines):
+    """Select structured proxy audit events independently of Slack routing."""
+    selected = []
+    for line in lines:
+        if parse_json_level(line) not in JSON_WARNING_LEVELS:
+            continue
+        start = line.message.find("{")
+        try:
+            value, _ = json.JSONDecoder().raw_decode(line.message[start:])
+        except ValueError:
+            continue
+        if value.get("event_type") == "unpaginated_call":
+            selected.append(line)
+    return selected
+
+
 def newest_line(lines):
     """Return the line with the latest timestamp, breaking ties by list order.
 

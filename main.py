@@ -60,11 +60,16 @@ def check_app(app_name):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=config.LOG_LOOKBACK_HOURS)
     new_lines = log_parser.filter_since(new_lines, cutoff)
     errors, warnings = log_parser.classify(new_lines, config.REPORT_WARNINGS)
+    audit_lines = log_parser.unpaginated_call_warnings(new_lines)
+    if audit_lines:
+        if reported_lines.store_call_audit(app_name, audit_lines) != len(audit_lines):
+            raise RuntimeError("incomplete call audit storage")
+    archived_warnings = [line for line in warnings if line not in audit_lines]
 
     if errors or warnings:
         if has_state_store:
             try:
-                reported_lines.store(app_name, errors, warnings)
+                reported_lines.store(app_name, errors, archived_warnings)
             except Exception as exc:  # noqa: BLE001 - still report and advance the watermark
                 print(f"{app_name}: ERROR could not store reported lines - {type(exc).__name__}")
         slack_notifier.send_error_report(app_name, errors, warnings)

@@ -73,6 +73,11 @@ def evaluate(status, app_name, stale_minutes):
         reason = status.get("last_slack_failure") or "unknown"
         problems.append(f"receiver's most recent Slack post failed at {_utc(failed_at)} ({reason})")
 
+    audit_failed = status.get("last_audit_failure_at")
+    audit_ok = status.get("last_audit_ok_at")
+    if audit_failed is not None and (audit_ok is None or audit_failed > audit_ok):
+        problems.append(f"receiver's most recent call audit storage failed at {_utc(audit_failed)}")
+
     return problems
 
 

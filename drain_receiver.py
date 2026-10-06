@@ -131,6 +131,8 @@ class DrainState:
         self.last_slack_ok_at = None
         self.last_slack_failure_at = None
         self.last_slack_failure = None
+        self.last_audit_ok_at = None
+        self.last_audit_failure_at = None
 
     def record_frame(self, app_name):
         with self._lock:
@@ -154,12 +156,33 @@ class DrainState:
                 "last_slack_failure_at": self.last_slack_failure_at,
                 "last_slack_failure": self.last_slack_failure,
                 "flusher_running": self._flusher is not None and self._flusher.is_alive(),
+                "last_audit_ok_at": self.last_audit_ok_at,
+                "last_audit_failure_at": self.last_audit_failure_at,
             }
 
     def is_duplicate_frame(self, frame_id):
         """True if this Logplex frame was already accepted (Logplex retries on failure)."""
         if not frame_id:
             return False
+
+    def accept_frame(self, frame_id, app_name, audit_lines):
+        """Serialize duplicate frames, persist audit, then commit acceptance."""
+        with self._lock:
+            if frame_id and frame_id in self._seen_frames:
+                return False
+            if audit_lines:
+                try:
+                    if reported_lines.store_call_audit(app_name, audit_lines) != len(audit_lines):
+                        raise RuntimeError("incomplete call audit storage")
+                except Exception:
+                    self.last_audit_failure_at = time.time()
+                    raise
+                self.last_audit_ok_at = time.time()
+            if frame_id:
+                self._seen_frames[frame_id] = None
+                if len(self._seen_frames) > _SEEN_FRAME_IDS_MAX:
+                    self._seen_frames.popitem(last=False)
+            return True
         with self._lock:
             if frame_id in self._seen_frames:
                 return True
@@ -207,7 +230,9 @@ class DrainState:
         if not config.DATABASE_URL or not (buf.errors or buf.warnings):
             return
         try:
-            reported_lines.store(app_name, buf.errors, buf.warnings)
+            audit_lines = log_parser.unpaginated_call_warnings(buf.warnings)
+            warnings = [line for line in buf.warnings if line not in audit_lines]
+            reported_lines.store(app_name, buf.errors, warnings)
         except Exception as exc:  # noqa: BLE001 - storage must never block the Slack post
             print(f"ERROR drain flush for {app_name} could not store reported lines: {type(exc).__name__}")
 
@@ -288,12 +313,17 @@ def app(environ, start_response):
 
     STATE.ensure_flusher()
     STATE.record_frame(app_name)
-    if STATE.is_duplicate_frame(environ.get("HTTP_LOGPLEX_FRAME_ID")):
-        return _respond(start_response, "204 No Content")
-
     body = environ["wsgi.input"].read(length) if length else b""
     raw_lines = [line for line in map(to_log_line, parse_frames(body)) if line]
     lines = log_parser.parse_log_text("\n".join(raw_lines))
+    audit_lines = log_parser.unpaginated_call_warnings(lines)
+    try:
+        accepted = STATE.accept_frame(environ.get("HTTP_LOGPLEX_FRAME_ID"), app_name, audit_lines)
+    except Exception as exc:
+        print(f"ERROR drain call audit for {app_name} could not persist: {type(exc).__name__}")
+        return _respond(start_response, "503 Service Unavailable", headers=[("Retry-After", "5")])
+    if not accepted:
+        return _respond(start_response, "204 No Content")
     errors, warnings = classify_lines(lines)
     STATE.add(app_name, errors, warnings)
     return _respond(start_response, "204 No Content")

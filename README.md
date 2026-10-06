@@ -139,6 +139,24 @@ coverage plus an alert, never silence.
 
 ## Reported lines archive
 
+Structured proxy warnings with `event_type=unpaginated_call` are archived
+independently of `REPORT_WARNINGS`; disabling Slack warnings does not disable
+this caller audit. The drain persists these events synchronously to the existing
+`reported_lines` table before ACK and before recording the frame ID. Missing
+database configuration, failed or incomplete storage returns HTTP 503 so Logplex
+can retry. Concurrent copies of one frame are serialized. An uncertain database
+commit can yield duplicate rows on retry: query distinct raw lines when counting
+calls. Storage is at-least-once, not exactly-once.
+
+The existing archive table must be present before release. The audit path performs
+no DDL, uses a five-second connection timeout, three-second statement timeout
+and two-second lock timeout, and retains the existing 30-day pruning policy.
+`/status` exposes the most recent audit success/failure; the scheduled drain-health
+check surfaces an unresolved failure and falls back to the log pull. Scheduled
+pulls also archive these events before advancing their watermark, but retain the
+rolling-buffer coverage limitation described above. INFO and other unreported
+warning events keep their existing behavior.
+
 Every error/warning line sent to Slack is also written to the `reported_lines`
 table (`reported_lines.py`) by both the scheduled run and the drain receiver. Each row
 holds the app, severity, the line's own timestamp and the raw line. Rows older than
