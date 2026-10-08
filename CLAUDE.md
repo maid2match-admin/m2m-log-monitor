@@ -169,6 +169,12 @@ logged sporadic `H13 Connection closed without response` (service=0ms).
   ok/failure, and flush-thread liveness. `drain_health.evaluate()` is pure and
   measures ages on the receiver's clock. Any problem → `send_drain_problem` and
   `main.check_app` **falls through to the normal pull** for that app.
+- **Call audit (`unpaginated_call` warnings) never gates alerting.**
+  `DrainState.accept_frame` buffers a frame's errors first (once per frame ID,
+  via `_alerted_frames`), then writes the audit under `_audit_lock` — never under
+  `_lock`, which the flusher and `/status` share. An audit failure answers 503 so
+  Logplex retries the audit only. `main.check_app` likewise sends its report
+  before the audit write. Don't move the audit back in front of the alert path.
 - `_post_to_slack` / `send_error_report` / `send_drain_*` return whether Slack
   accepted the post (True in `DRY_RUN`). The receiver relies on this to detect
   a broken webhook, so don't revert them to returning None.

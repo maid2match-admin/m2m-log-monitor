@@ -11,7 +11,7 @@ import drain_receiver
 import log_parser
 import main
 import reported_lines
-from test_drain_receiver import basic, frame, post, syslog, _pulled_app
+from test_drain_receiver import JSON_ERROR, basic, frame, post, syslog, _pulled_app
 
 EVENT = json.dumps({"level":"WARNING","event_type":"unpaginated_call",
                     "message":"Unpaginated call to /v1/staff/bookings/range",
@@ -79,19 +79,73 @@ def test_concurrent_retry_persists_once(receiver,monkeypatch):
         return len(lines)
     monkeypatch.setattr(reported_lines,"store_call_audit",slow)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results=list(pool.map(lambda _:receiver.accept_frame("same","m2m-proxy",[audit_line()]),range(2)))
+        results=list(pool.map(lambda _:receiver.accept_frame("same","m2m-proxy",[],[],[audit_line()]),range(2)))
     assert sorted(results)==[False,True] and len(stored)==1
 
 
-def test_scheduled_audit_failure_does_not_advance_watermark(monkeypatch):
+def test_audit_failure_still_buffers_errors_in_the_same_frame(receiver,monkeypatch):
+    """A database outage must not hold back the errors that arrived beside an audit event."""
+    def failed(*_): raise RuntimeError("unavailable")
+    monkeypatch.setattr(reported_lines,"store_call_audit",failed)
+    body=frame(syslog("app","web.1",EVENT))+frame(syslog("app","web.1",JSON_ERROR))
+    assert post(body,auth=basic(),frame_id="mixed") == "503 Service Unavailable"
+    assert [l.message for l in receiver._buffers["m2m-proxy"].errors]==[JSON_ERROR]
+
+
+def test_audit_retry_does_not_report_errors_twice(receiver,monkeypatch):
+    calls=iter([RuntimeError("unavailable"),None])
+    def flaky(app,lines):
+        exc=next(calls)
+        if exc: raise exc
+        return len(lines)
+    monkeypatch.setattr(reported_lines,"store_call_audit",flaky)
+    body=frame(syslog("app","web.1",EVENT))+frame(syslog("app","web.1",JSON_ERROR))
+    assert post(body,auth=basic(),frame_id="mixed") == "503 Service Unavailable"
+    assert post(body,auth=basic(),frame_id="mixed") == "204 No Content"
+    assert post(body,auth=basic(),frame_id="mixed") == "204 No Content"
+    assert len(receiver._buffers["m2m-proxy"].errors)==1 and "mixed" in receiver._seen_frames
+
+
+def test_slow_audit_does_not_block_other_frames(receiver,monkeypatch):
+    """The audit write must not hold the buffer lock other frames, /status and the flusher need."""
+    started,release=threading.Event(),threading.Event()
+    def slow(app,lines):
+        started.set(); release.wait(2)
+        return len(lines)
+    monkeypatch.setattr(reported_lines,"store_call_audit",slow)
+    pending=threading.Thread(target=lambda:post(frame(syslog("app","web.1",EVENT)),auth=basic(),frame_id="slow"))
+    pending.start()
+    try:
+        assert started.wait(2)
+        began=time.monotonic()
+        assert post(frame(syslog("app","web.1",JSON_ERROR)),auth=basic(),frame_id="other") == "204 No Content"
+        receiver.status()
+        assert time.monotonic()-began < 0.5
+    finally:
+        release.set(); pending.join()
+
+
+def test_frame_without_audit_events_is_accepted_once(receiver,monkeypatch):
+    monkeypatch.setattr(reported_lines,"store_call_audit",lambda *_:pytest.fail("no audit expected"))
+    body=frame(syslog("app","web.1",JSON_ERROR))
+    assert post(body,auth=basic(),frame_id="plain") == "204 No Content"
+    assert post(body,auth=basic(),frame_id="plain") == "204 No Content"
+    assert len(receiver._buffers["m2m-proxy"].errors)==1
+
+
+def test_scheduled_audit_failure_reports_first_and_does_not_advance_watermark(monkeypatch):
     monkeypatch.setattr(config,"DRAIN_APPS",frozenset())
     monkeypatch.setattr(config,"DATABASE_URL","postgres://fake")
-    _pulled_app(monkeypatch,"2099-01-01T00:00:00+00:00 app[web.1]: "+EVENT)
-    moved=[]
+    _pulled_app(monkeypatch,"2099-01-01T00:00:00+00:00 app[web.1]: "+EVENT+"\n"
+                "2099-01-01T00:00:01+00:00 app[web.1]: "+JSON_ERROR+"\n")
+    moved,reported=[],[]
     monkeypatch.setattr(main.state_store,"set_last_state",lambda *args:moved.append(args))
+    monkeypatch.setattr(main.reported_lines,"store",lambda *_:None)
+    monkeypatch.setattr(main.slack_notifier,"send_error_report",lambda app,errors,warnings:reported.append(errors) or True)
     monkeypatch.setattr(reported_lines,"store_call_audit",lambda *_:0)
     with pytest.raises(RuntimeError,match="incomplete"):
         main.check_app("m2m-sandbox-proxy")
+    assert [[l.message for l in errors] for errors in reported]==[[JSON_ERROR]]
     assert moved==[]
 
 

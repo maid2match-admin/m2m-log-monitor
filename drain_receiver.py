@@ -101,6 +101,15 @@ def classify_lines(lines):
     return errors, warnings
 
 
+def _remember(frames, frame_id):
+    """Record a frame ID in a bounded, oldest-first set. No-op without an ID."""
+    if not frame_id:
+        return
+    frames[frame_id] = None
+    if len(frames) > _SEEN_FRAME_IDS_MAX:
+        frames.popitem(last=False)
+
+
 class _AppBuffer:
     def __init__(self):
         self.errors = []
@@ -122,8 +131,15 @@ class DrainState:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # Serializes call-audit writes. It is held across a database round
+        # trip, so never take it while holding self._lock.
+        self._audit_lock = threading.Lock()
         self._buffers: dict[str, _AppBuffer] = {}
+        # Frames fully accepted: alerts buffered and any call audit stored.
         self._seen_frames: OrderedDict[str, None] = OrderedDict()
+        # Frames whose alerts are buffered but whose audit may still need a
+        # retry, so the retry doesn't report the same errors twice.
+        self._alerted_frames: OrderedDict[str, None] = OrderedDict()
         self._flusher = None
         # Health, read by the scheduled run via GET /status. Epoch seconds.
         self.started_at = time.time()
@@ -160,43 +176,53 @@ class DrainState:
                 "last_audit_failure_at": self.last_audit_failure_at,
             }
 
-    def is_duplicate_frame(self, frame_id):
-        """True if this Logplex frame was already accepted (Logplex retries on failure)."""
-        if not frame_id:
-            return False
+    def accept_frame(self, frame_id, app_name, errors, warnings, audit_lines):
+        """Buffer a frame's alerts, then persist its call audit. False for a duplicate.
 
-    def accept_frame(self, frame_id, app_name, audit_lines):
-        """Serialize duplicate frames, persist audit, then commit acceptance."""
+        Alerts are buffered first, once per frame ID, so an audit failure never
+        holds back an error report: the failure is raised for the caller to
+        answer 503, and Logplex's retry of the frame only re-attempts the
+        audit. The database write runs under its own lock, never the buffer
+        lock, so a slow insert cannot stall other frames, /status or the
+        flusher. Concurrent copies of one frame still serialize on it, and the
+        loser sees the frame as already accepted.
+        """
         with self._lock:
             if frame_id and frame_id in self._seen_frames:
                 return False
-            if audit_lines:
-                try:
-                    if reported_lines.store_call_audit(app_name, audit_lines) != len(audit_lines):
-                        raise RuntimeError("incomplete call audit storage")
-                except Exception:
-                    self.last_audit_failure_at = time.time()
-                    raise
-                self.last_audit_ok_at = time.time()
-            if frame_id:
-                self._seen_frames[frame_id] = None
-                if len(self._seen_frames) > _SEEN_FRAME_IDS_MAX:
-                    self._seen_frames.popitem(last=False)
-            return True
-        with self._lock:
-            if frame_id in self._seen_frames:
+            if not (frame_id and frame_id in self._alerted_frames):
+                self._buffer(app_name, errors, warnings)
+                _remember(self._alerted_frames, frame_id)
+            if not audit_lines:
+                _remember(self._seen_frames, frame_id)
                 return True
-            self._seen_frames[frame_id] = None
-            if len(self._seen_frames) > _SEEN_FRAME_IDS_MAX:
-                self._seen_frames.popitem(last=False)
-            return False
+
+        with self._audit_lock:
+            with self._lock:
+                if frame_id and frame_id in self._seen_frames:
+                    return False
+            try:
+                if reported_lines.store_call_audit(app_name, audit_lines) != len(audit_lines):
+                    raise RuntimeError("incomplete call audit storage")
+            except Exception:
+                with self._lock:
+                    self.last_audit_failure_at = time.time()
+                raise
+            with self._lock:
+                self.last_audit_ok_at = time.time()
+                _remember(self._seen_frames, frame_id)
+            return True
 
     def add(self, app_name, errors, warnings):
+        with self._lock:
+            self._buffer(app_name, errors, warnings)
+
+    def _buffer(self, app_name, errors, warnings):
+        """Append to an app's buffer. The caller holds self._lock."""
         if not (errors or warnings):
             return
-        with self._lock:
-            buffer = self._buffers.setdefault(app_name, _AppBuffer())
-            buffer.add(errors, warnings, config.DRAIN_MAX_BUFFERED_LINES)
+        buffer = self._buffers.setdefault(app_name, _AppBuffer())
+        buffer.add(errors, warnings, config.DRAIN_MAX_BUFFERED_LINES)
 
     def flush(self):
         """Post every non-empty buffer to Slack and reset it."""
@@ -316,14 +342,12 @@ def app(environ, start_response):
     body = environ["wsgi.input"].read(length) if length else b""
     raw_lines = [line for line in map(to_log_line, parse_frames(body)) if line]
     lines = log_parser.parse_log_text("\n".join(raw_lines))
+    errors, warnings = classify_lines(lines)
     audit_lines = log_parser.unpaginated_call_warnings(lines)
     try:
-        accepted = STATE.accept_frame(environ.get("HTTP_LOGPLEX_FRAME_ID"), app_name, audit_lines)
+        STATE.accept_frame(environ.get("HTTP_LOGPLEX_FRAME_ID"), app_name, errors, warnings, audit_lines)
     except Exception as exc:
+        # The frame's alerts are already buffered; only the audit needs the retry.
         print(f"ERROR drain call audit for {app_name} could not persist: {type(exc).__name__}")
         return _respond(start_response, "503 Service Unavailable", headers=[("Retry-After", "5")])
-    if not accepted:
-        return _respond(start_response, "204 No Content")
-    errors, warnings = classify_lines(lines)
-    STATE.add(app_name, errors, warnings)
     return _respond(start_response, "204 No Content")

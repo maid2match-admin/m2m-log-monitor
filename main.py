@@ -61,9 +61,6 @@ def check_app(app_name):
     new_lines = log_parser.filter_since(new_lines, cutoff)
     errors, warnings = log_parser.classify(new_lines, config.REPORT_WARNINGS)
     audit_lines = log_parser.unpaginated_call_warnings(new_lines)
-    if audit_lines:
-        if reported_lines.store_call_audit(app_name, audit_lines) != len(audit_lines):
-            raise RuntimeError("incomplete call audit storage")
     archived_warnings = [line for line in warnings if line not in audit_lines]
 
     if errors or warnings:
@@ -75,6 +72,13 @@ def check_app(app_name):
         slack_notifier.send_error_report(app_name, errors, warnings)
     elif has_state_store and had_errors_before:
         slack_notifier.send_resolved(app_name)
+
+    # After the report, so an audit failure never withholds an alert. A failure
+    # still raises before the watermark moves: the next run retries the audit
+    # (re-sending this run's report — a duplicate, never a gap).
+    if audit_lines:
+        if reported_lines.store_call_audit(app_name, audit_lines) != len(audit_lines):
+            raise RuntimeError("incomplete call audit storage")
 
     if has_state_store:
         newest = log_parser.newest_line(lines)

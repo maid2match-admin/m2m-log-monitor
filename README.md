@@ -144,17 +144,22 @@ independently of `REPORT_WARNINGS`; disabling Slack warnings does not disable
 this caller audit. The drain persists these events synchronously to the existing
 `reported_lines` table before ACK and before recording the frame ID. Missing
 database configuration, failed or incomplete storage returns HTTP 503 so Logplex
-can retry. Concurrent copies of one frame are serialized. An uncertain database
-commit can yield duplicate rows on retry: query distinct raw lines when counting
-calls. Storage is at-least-once, not exactly-once.
+can retry. A frame's errors are buffered for Slack **before** the audit write, once
+per frame ID, so a database outage never holds back an alert and a retried frame
+never reports its errors twice. Concurrent copies of one frame are serialized on a
+lock separate from the alert buffers, so a slow insert does not stall other apps.
+An uncertain database commit can yield duplicate rows on retry: query distinct raw
+lines when counting calls. Storage is at-least-once, not exactly-once.
 
 The existing archive table must be present before release. The audit path performs
 no DDL, uses a five-second connection timeout, three-second statement timeout
 and two-second lock timeout, and retains the existing 30-day pruning policy.
 `/status` exposes the most recent audit success/failure; the scheduled drain-health
 check surfaces an unresolved failure and falls back to the log pull. Scheduled
-pulls also archive these events before advancing their watermark, but retain the
-rolling-buffer coverage limitation described above. INFO and other unreported
+pulls archive these events after sending the Slack report and before advancing
+their watermark, so a failed audit write re-sends that report on the next run
+rather than dropping it; they retain the rolling-buffer coverage limitation
+described above. INFO and other unreported
 warning events keep their existing behavior.
 
 Every error/warning line sent to Slack is also written to the `reported_lines`
